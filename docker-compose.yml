@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  # 1. The PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: shopify_db
+    environment:
+      - POSTGRES_DB=taxonomy_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+  # 2. The Message Broker (Redis)
+  redis:
+    image: redis:alpine
+    container_name: shopify_redis
+    restart: always
+
+  # 3. The Django API Server (Gunicorn)
+  web:
+    build: .
+    container_name: shopify_web
+    command: gunicorn taxonomy_project.wsgi:application --bind 0.0.0.0:8000
+    depends_on:
+      - db
+      - redis
+    env_file:
+      - .env
+    environment:
+      - DB_NAME=taxonomy_db
+      - DB_USER=postgres
+      - DB_PASSWORD=password
+      - DB_HOST=db  # Points to the 'db' container!
+    restart: always
+
+  # 4. The Autonomous AI Agent (Celery Worker)
+  worker:
+    build: .
+    container_name: shopify_worker
+    # No need for 'eventlet' in Docker since it's running on Linux!
+    command: celery -A taxonomy_project worker -l INFO
+    depends_on:
+      - db
+      - redis
+    env_file:
+      - .env
+    environment:
+      - DB_NAME=taxonomy_db
+      - DB_USER=postgres
+      - DB_PASSWORD=password
+      - DB_HOST=db
+    restart: always
+
+  # 5. The Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: shopify_nginx
+    ports:
+      - "80:80" # Opens your web server to the outside world
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - web
+    restart: always
+
+volumes:
+  postgres_data:

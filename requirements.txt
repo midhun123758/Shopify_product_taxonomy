@@ -1,0 +1,15 @@
+django>=5.0
+djangorestframework
+celery
+redis
+pandas
+openpyxl
+psycopg2-binary
+langchain-openai
+langchain-core
+pydantic
+drf-spectacular
+python-dotenv
+gunicorn
+django-celery-results
+langchain-google-genai
