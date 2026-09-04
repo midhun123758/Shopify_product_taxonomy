@@ -24,6 +24,8 @@ load_dotenv(os.path.join(BASE_DIR, '.env'))
 # Tell Django to use Spectacular for API schema generation
 REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 50,  # Only send 50 products per page!
 }
 
 SPECTACULAR_SETTINGS = {
@@ -42,8 +44,13 @@ SECRET_KEY = 'django-insecure-bz+ufd90dl=2@4461h&2vs5+*xk1kq0h2@_avvi-lt#&)x^=0i
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['*']
 
+# Allow large file uploads (e.g., 50MB) for Excel spreadsheets
+DATA_UPLOAD_MAX_MEMORY_SIZE = 52428800
+
+# Allow all origins for the frontend React app (localhost:5173)
+CORS_ALLOW_ALL_ORIGINS = True
 
 # Application definition
 
@@ -57,10 +64,12 @@ INSTALLED_APPS = [
     'rest_framework',
     'classifier',
     'drf_spectacular',
-    'django_celery_results'
+    'django_celery_results',
+    'corsheaders',
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',

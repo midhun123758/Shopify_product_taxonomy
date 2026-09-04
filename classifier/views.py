@@ -1,5 +1,6 @@
 import pandas as pd
 from rest_framework.views import APIView
+from rest_framework import generics
 from rest_framework.response import Response
 from rest_framework import status
 from django.shortcuts import get_object_or_404
@@ -107,34 +108,34 @@ class ImportExcelAPIView(APIView):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class ProductListAPIView(APIView):
+class ProductListAPIView(generics.ListAPIView):
     """
-    GET /api/products/
-    Returns all products and their classification status.
+    GET /api/products/?status=COMPLETED
+    Returns products (optionally filtered by status) with pagination.
     """
     serializer_class = ProductSerializer
 
-    def get(self, request, *args, **kwargs):
-        products = Product.objects.all()
-        serializer = ProductSerializer(products, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+    def get_queryset(self):
+        queryset = Product.objects.all().order_by('-id')
+        status_param = self.request.query_params.get('status', None)
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        return queryset
 
 
-class ReviewListAPIView(APIView):
+class ReviewListAPIView(generics.ListAPIView):
     """
     GET /api/products/review/
     Returns ONLY products where the AI had low confidence (Requirement #9).
+    Paginated automatically.
     """
     serializer_class = ProductSerializer
-
-    def get(self, request, *args, **kwargs):
-        products = Product.objects.filter(status='MANUAL_REVIEW')
-        serializer = ProductSerializer(products, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+    queryset = Product.objects.filter(status='MANUAL_REVIEW').order_by('-id')
 
 
 class ProductUpdateSerializer(serializers.Serializer):
-    category_id = serializers.CharField(help_text="The ID of the new category")
+    category_id = serializers.CharField(required=False, help_text="The ID of the new category")
+    category_name = serializers.CharField(required=False, help_text="The name of the new category to look up")
 
 class ProductUpdateAPIView(APIView):
     """
@@ -146,12 +147,77 @@ class ProductUpdateAPIView(APIView):
     def patch(self, request, pk, *args, **kwargs):
         product = get_object_or_404(Product, pk=pk)
         
-        # If the human sends a new category ID, update it
+        category = None
         if 'category_id' in request.data:
             category = get_object_or_404(Category, id=request.data['category_id'])
+        elif 'category_name' in request.data:
+            # Robust matching: Try to match leaf node if full path not matched perfectly
+            name = request.data['category_name'].replace('Raw AI Output: ', '').strip()
+            leaf_node = name.split('>')[-1].strip()
+            
+            category = Category.objects.filter(name__iendswith=f"> {leaf_node}").first()
+            if not category:
+                category = Category.objects.filter(name__iexact=leaf_node).first()
+                
+            if not category:
+                return Response({"error": f"Could not find a category matching '{name}'"}, status=status.HTTP_400_BAD_REQUEST)
+                
+        if category:
             product.predicted_category = category
             product.status = 'COMPLETED' # Human approved it!
             product.save()
-            return Response({"message": "Product successfully manually categorized."}, status=status.HTTP_200_OK)
+            return Response({"message": "Product successfully manually categorized.", "new_category": category.name}, status=status.HTTP_200_OK)
             
-        return Response({"error": "Please provide a category_id"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"error": "Please provide a category_id or category_name"}, status=status.HTTP_400_BAD_REQUEST)
+
+class ProductStatsAPIView(APIView):
+    """
+    GET /api/products/stats/
+    Instantly returns the counts of products by status using SQL aggregation.
+    """
+    def get(self, request, *args, **kwargs):
+        stats = {
+            "pending": Product.objects.filter(status='PENDING').count(),
+            "processing": Product.objects.filter(status='PROCESSING').count(),
+            "completed": Product.objects.filter(status='COMPLETED').count(),
+            "review": Product.objects.filter(status='MANUAL_REVIEW').count(),
+            "total": Product.objects.count()
+        }
+        return Response(stats, status=status.HTTP_200_OK)
+
+import redis
+
+class PauseProcessingAPIView(APIView):
+    """
+    POST /api/products/pause/
+    Sets a global flag in Redis to stop Celery workers from starting new batches.
+    """
+    def post(self, request, *args, **kwargs):
+        try:
+            r = redis.Redis(host='redis', port=6379, db=0)
+            r.set('PAUSE_AI_PROCESSING', '1')
+            return Response({"message": "AI Processing has been PAUSED. No new batches will start."}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class ResumeProcessingAPIView(APIView):
+    """
+    POST /api/products/resume/
+    Removes the global pause flag and re-queues any remaining PENDING products.
+    """
+    def post(self, request, *args, **kwargs):
+        try:
+            r = redis.Redis(host='redis', port=6379, db=0)
+            r.set('PAUSE_AI_PROCESSING', '0')
+            
+            # Re-queue all pending products
+            pending_products = Product.objects.filter(status='PENDING')
+            product_ids = [p.id for p in pending_products]
+            
+            for i in range(0, len(product_ids), 18):
+                batch = product_ids[i:i+18]
+                classify_product_batch_task.delay(batch)
+                
+            return Response({"message": f"AI Processing RESUMED. {len(product_ids)} products re-queued."}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
