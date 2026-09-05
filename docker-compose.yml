@@ -24,6 +24,8 @@ services:
     build: .
     container_name: shopify_web
     command: gunicorn taxonomy_project.wsgi:application --bind 0.0.0.0:8000
+    volumes:
+      - .:/app
     depends_on:
       - db
       - redis
@@ -41,7 +43,10 @@ services:
     build: .
     container_name: shopify_worker
     # No need for 'eventlet' in Docker since it's running on Linux!
-    command: celery -A taxonomy_project worker -l INFO
+    # Using --concurrency=1 to prevent hitting the Gemini Free Tier limit (15 requests/minute)
+    command: celery -A taxonomy_project worker -l INFO --concurrency=1
+    volumes:
+      - .:/app
     depends_on:
       - db
       - redis
