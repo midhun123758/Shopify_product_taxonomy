@@ -1,117 +1,181 @@
 import os
+import json
 from celery import shared_task
-from .models import Product, Category
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.output_parsers import JsonOutputParser
-from langchain_core.messages import HumanMessage
-import requests
-import base64
-from pydantic import BaseModel, Field
-from typing import List
+from django.conf import settings
+from .models import ProductFamily, Category
+import google.generativeai as genai
 
-# 1. NEW: Batch Result Models
-class ProductClassificationResult(BaseModel):
-    product_id: int = Field(description="The exact database ID of the product")
-    category_name: str = Field(description="The exact name of the official Shopify category")
-    confidence: float = Field(description="Confidence score between 0.0 and 1.0")
-    extracted_attributes: dict = Field(description="JSON object of key-value pairs like {'Color': 'Red', 'Material': 'Leather'}")
-    alternative_suggestions: list[str] = Field(description="List of 2 backup category names if confidence is low")
+# Load simplified taxonomy
+TAXONOMY_FILE = os.path.join(settings.BASE_DIR, 'simplified_taxonomy.json')
+with open(TAXONOMY_FILE, 'r') as f:
+    TAXONOMY_DATA = json.load(f)
 
-class BatchClassificationResult(BaseModel):
-    results: List[ProductClassificationResult] = Field(description="List of classification results for all products in this batch")
 
-# 2. NEW: Celery Task processing an array of IDs
-@shared_task(rate_limit='4/m', autoretry_for=(Exception,), retry_backoff=True)
-def classify_product_batch_task(product_ids):
-    products = list(Product.objects.filter(id__in=product_ids))
-    for p in products:
-        p.status = 'PROCESSING'
-        p.save()
+# Build a list of valid category paths for AI matching
+VALID_CATEGORIES = []
+for category_name, subcategories in TAXONOMY_DATA.items():
+    if not subcategories:
+        VALID_CATEGORIES.append(category_name)
+    else:
+        for sub in subcategories:
+            VALID_CATEGORIES.append(f"{category_name} > {sub}")
+
+
+def guarded_fuzzy_match(raw_ai_output: str, brand: str) -> tuple[Category | None, str, list[str]]:   
+    import re
+    from django.db import connection
+    
+    clean_output = raw_ai_output.replace('Raw AI Output: ', '').strip()
+    match = re.search(r'([A-Za-z0-9_& /-]+ > [A-Za-z0-9_& /-]+(?: > [A-Za-z0-9_& /-]+)?)', clean_output)
+    
+    predicted_path = match.group(1) if match else clean_output
+    predicted_path = predicted_path.strip()
+
+    if not predicted_path:
+        return None, "FAILED", []
+
+    leaf_node = predicted_path.split('>')[-1].strip()
+    parent_path_expected = ">".join([p.strip() for p in predicted_path.split('>')[:-1]])
+
+    # 1. ILIKE search with leaf node or full output
+    with connection.cursor() as cursor:
+        cursor.execute('''
+            SELECT id, name, similarity(name, %s::text) as sim
+            FROM classifier_category
+            WHERE name ILIKE %s::text OR name ILIKE %s::text
+            ORDER BY sim DESC
+            LIMIT 5;
+        ''', [clean_output, f'%{leaf_node}%', f'%{clean_output}%'])
+        results = cursor.fetchall()
+
+    # 2. Fallback trigram similarity using max of full path vs leaf node
+    if not results:
+        with connection.cursor() as cursor:
+            cursor.execute('''
+                SELECT id, name, GREATEST(similarity(name, %s::text), similarity(name, %s::text)) as sim
+                FROM classifier_category
+                ORDER BY sim DESC
+                LIMIT 5;
+            ''', [clean_output, leaf_node])
+            results = cursor.fetchall()
+
+    if not results:
+        return None, "MANUAL_REVIEW", []
+
+    best_match_id, best_match_name, best_match_sim = results[0]
+
+    alt_suggestions = [row[1] for row in results[1:]] if len(results) > 1 else []
+
+    if parent_path_expected:
+        best_match_parents = ">".join([p.strip() for p in best_match_name.split('>')[:-1]])
+        if best_match_parents.lower() != parent_path_expected.lower():
+            if best_match_sim < 0.6:
+                return None, "MANUAL_REVIEW", alt_suggestions
+            else:
+                return None, "MANUAL_REVIEW", [best_match_name] + alt_suggestions
+
+    if best_match_sim > 0.4:
+        category = Category.objects.get(id=best_match_id)
+        if brand and brand.lower() in category.name.lower():
+            return None, "MANUAL_REVIEW", [best_match_name] + alt_suggestions
+        return category, "COMPLETED", alt_suggestions
+    else:
+        return None, "MANUAL_REVIEW", [best_match_name] + alt_suggestions
+
+@shared_task(bind=True, max_retries=5)
+def classify_family_task(self, family_id):
+    """
+    Classify a single ProductFamily using Gemini.
+    Uses a short prompt to stay within free-tier token limits,
+    then fuzzy-matches the response to our real category database.
+    """
+    try:
+        family = ProductFamily.objects.get(id=family_id)
+    except ProductFamily.DoesNotExist:
+        return "Family not found."
+
+    # Load product image if URL exists for Multimodal AI analysis
+    first_p = family.products.exclude(image_url='').exclude(image_url__isnull=True).first()
+    image_url = first_p.image_url if first_p else None
+
+    img_obj = None
+    if image_url:
+        try:
+            import requests
+            from PIL import Image
+            from io import BytesIO
+            res = requests.get(image_url, timeout=5)
+            if res.status_code == 200:
+                img_obj = Image.open(BytesIO(res.content))
+        except Exception as img_err:
+            import logging
+            logging.warning(f"Could not load image for family {family.id}: {img_err}")
+
+    # Include title, type, brand, and description text for full context
+    desc_snippet = (family.description or '')[:600]
+    prompt = f"""You are an e-commerce product classifier.
+Given the product below, analyze both its visual product image (if provided) and text details to output the best Shopify taxonomy category path using this format:
+  Category: <Top Level> > <Sub Category> > <Leaf Category>
+Then extract key attributes as compact JSON.
+
+Product: {family.normalized_title}
+Type: {family.product_type}
+Brand: {family.brand}
+Description: {desc_snippet}
+
+Respond ONLY in this format (no extra text):
+Category: ...
+Attributes: {{"material": "...", "style": "...", "size": "..."}}"""
 
     try:
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-3.5-flash-lite",
-            temperature=0.1,
-            api_key=os.environ.get("GEMINI_API_KEY", "your-gemini-key-here")
-        )
-        parser = JsonOutputParser(pydantic_object=BatchClassificationResult)
-        
-        # Build the mega-prompt for all products
-        text_prompt = "You are an expert e-commerce catalog manager.\n"
-        text_prompt += "Classify the following products into a single official Shopify category.\n"
-        text_prompt += "Extract relevant attributes and suggest backup categories for EACH product.\n\n"
-        
-        message_content = [{"type": "text", "text": text_prompt}]
-        
-        for p in products:
-            product_text = f"\n--- Product ID {p.id} ---\n"
-            product_text += f"Title: {p.title}\n"
-            product_text += f"Description: {p.description or 'None'}\n"
-            product_text += f"Brand: {p.brand or 'None'}\n"
-            product_text += f"Product Type: {p.product_type or 'None'}\n"
-            
-            message_content.append({"type": "text", "text": product_text})
-            
-            # Attach the multimodal image!
-            if p.image_url and p.image_url.startswith("http"):
-                try:
-                    response = requests.get(p.image_url, timeout=5)
-                    if response.status_code == 200:
-                        image_data = base64.b64encode(response.content).decode('utf-8')
-                        mime_type = "image/png" if "png" in p.image_url.lower() else "image/jpeg"
-                        message_content.append({"type": "text", "text": f"Image for Product ID {p.id}:"})
-                        message_content.append({
-                            "type": "image_url", 
-                            "image_url": {"url": f"data:{mime_type};base64,{image_data}"}
-                        })
-                except Exception:
-                    pass # Image failed, AI falls back to text automatically
-                    
-        # Append the JSON output requirements
-        message_content.append({"type": "text", "text": f"\n\n{parser.get_format_instructions()}"})
-        message = HumanMessage(content=message_content)
-        
-        # Call the AI (1 API request for X products!)
-        ai_response = llm.invoke([message])
-        batch_result = parser.invoke(ai_response)
-        
-        # Save results back to DB
-        for res in batch_result.get("results", []):
-            pid = res.get("product_id")
-            product = next((p for p in products if p.id == pid), None)
-            if not product:
-                continue
-                
-            predicted_name = res.get("category_name", "")
-            confidence = float(res.get("confidence", 0.0))
-            
-            product.extracted_attributes = res.get("extracted_attributes", {})
-            product.alternative_suggestions = res.get("alternative_suggestions", [])
-            
-            # Extract the leaf node from the AI's predicted string (e.g. 'Home & Garden > Furniture > Sofas' -> 'Sofas')
-            leaf_node = predicted_name.split('>')[-1].strip()
-            
-            # Robustly match the leaf node to the database format (which might not have the 'Home & Garden' root)
-            category_match = Category.objects.filter(name__iendswith=f"> {leaf_node}").first()
-            if not category_match:
-                category_match = Category.objects.filter(name__iexact=leaf_node).first()
-                
-            if category_match:
-                product.predicted_category = category_match
-                product.confidence_score = confidence
-                product.status = 'COMPLETED' if confidence >= 0.85 else 'MANUAL_REVIEW'
-            else:
-                product.status = 'MANUAL_REVIEW'
-                product.confidence_score = 0.0
-                product.alternative_suggestions = [f"Raw AI Output: {predicted_name}"] + product.alternative_suggestions
-                
-            product.save()
-            
-        return f"Successfully classified batch of {len(product_ids)} products."
-        
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-3.6-flash')
+
+        payload = [prompt, img_obj] if img_obj else [prompt]
+        response = model.generate_content(payload)
+        text = response.text
+
+        import re
+        cat_match = re.search(r'Category:\s*(.+)', text, re.IGNORECASE)
+        attr_match = re.search(r'Attributes:\s*(\{.*?\})', text, re.DOTALL | re.IGNORECASE)
+
+        raw_category = cat_match.group(1).strip() if cat_match else text.strip()
+        attributes = {}
+        if attr_match:
+            try:
+                attributes = json.loads(attr_match.group(1))
+            except:
+                pass
+
+        category, status, alts = guarded_fuzzy_match(raw_category, family.brand)
+
+        family.predicted_category = category
+        family.status = status
+        family.alternative_suggestions = alts
+        family.extracted_attributes = attributes
+        family.confidence_score = 0.95 if status == "COMPLETED" else 0.4
+        family.save()
+        return f"Family {family.id} classified as {status}."
+
     except Exception as e:
-        for p in products:
-            if p.status == 'PROCESSING':
-                p.status = 'FAILED'
-                p.save()
-        raise e # Explicitly raise so Celery triggers the autoretry_for logic!
+        import logging
+        error_str = str(e)
+        logging.error(f"Gemini API error for family {family.id}: {e}")
+
+        # Rate limit — retry after the suggested delay (default 60s)
+        if '429' in error_str:
+            retry_delay = 60
+            import re as re2
+            delay_match = re2.search(r'retry_delay\s*\{\s*seconds:\s*(\d+)', error_str)
+            if delay_match:
+                retry_delay = int(delay_match.group(1)) + 5
+            raise self.retry(exc=e, countdown=retry_delay)
+
+        # Temporary server error — exponential backoff
+        if '503' in error_str:
+            raise self.retry(exc=e, countdown=2 ** self.request.retries)
+
+        family.status = 'FAILED'
+        family.save()
+        return f"Failed family {family.id}: {error_str}"
+

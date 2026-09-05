@@ -13,3 +13,7 @@ python-dotenv
 gunicorn
 django-celery-results
 langchain-google-genai
+django-cors-headers
+google-generativeai
+Pillow
+requests
