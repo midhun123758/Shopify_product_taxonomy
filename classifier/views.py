@@ -166,9 +166,6 @@ class AnalyzeFamilyAPIView(APIView):
     """
     def post(self, request, pk, *args, **kwargs):
         family = get_object_or_404(ProductFamily, pk=pk)
-        if family.status == 'COMPLETED':
-            return Response({"message": "Already classified."}, status=status.HTTP_400_BAD_REQUEST)
-            
         family.status = 'PROCESSING'
         family.save()
         
@@ -253,7 +250,9 @@ class ResumeProcessingAPIView(APIView):
         try:
             r = redis.Redis(host='redis', port=6379, db=0)
             r.set('PAUSE_AI_PROCESSING', '0')
-            return Response({"message": "AI Processing RESUMED. (Bulk queueing not implemented in Pandas On-Demand mode yet)."}, status=status.HTTP_200_OK)
+            from .tasks import process_all_pending_families_task
+            process_all_pending_families_task.delay(limit=100)
+            return Response({"message": "AI Processing RESUMED. Started background batch classification for pending families."}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 

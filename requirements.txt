@@ -17,3 +17,5 @@ django-cors-headers
 google-generativeai
 Pillow
 requests
+qdrant-client
+fastembed
