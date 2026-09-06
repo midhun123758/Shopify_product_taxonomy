@@ -287,4 +287,121 @@ class ProductDetailAPIView(APIView):
         return Response({
             **product_data,
             'family': family_data
-        }, status=status.HTTP_200_OK)
+        }, status=status.HTTP_200_OK)
+
+
+class CategorySearchAPIView(APIView):
+    """
+    GET /api/categories/search/?q=dining
+    Fuzzy / trigram & substring search across Shopify Taxonomy categories.
+    """
+    def get(self, request, *args, **kwargs):
+        query = request.query_params.get('q', '').strip()
+        if not query:
+            # Return root categories (no '>' in name or parent is null)
+            roots = Category.objects.filter(~Q(name__contains='>')).order_by('name')[:40]
+            results = []
+            for c in roots:
+                results.append({
+                    'id': c.id,
+                    'name': c.name,
+                    'leaf_name': c.name,
+                    'depth': 1,
+                    'breadcrumb': [c.name],
+                    'similarity': 1.0
+                })
+            return Response(results, status=status.HTTP_200_OK)
+
+        from django.db import connection
+        with connection.cursor() as cursor:
+            cursor.execute('''
+                SELECT id, name, similarity(name, %s::text) as sim
+                FROM classifier_category
+                WHERE name ILIKE %s OR similarity(name, %s::text) > 0.15
+                ORDER BY sim DESC, name ASC
+                LIMIT 50;
+            ''', [query, f"%{query}%", query])
+            rows = cursor.fetchall()
+
+        results = []
+        for r in rows:
+            cat_id, cat_name, sim = r[0], r[1], r[2]
+            parts = [p.strip() for p in cat_name.split('>')]
+            results.append({
+                'id': cat_id,
+                'name': cat_name,
+                'leaf_name': parts[-1] if parts else cat_name,
+                'depth': len(parts),
+                'breadcrumb': parts,
+                'similarity': float(sim or 0)
+            })
+
+        return Response(results, status=status.HTTP_200_OK)
+
+
+class CategoryWayfindAPIView(APIView):
+    """
+    GET /api/categories/wayfind/?category_id=... or GET /api/categories/<id>/wayfind/
+    Returns full hierarchy details for category wayfinding:
+    - Breadcrumb navigation list
+    - Immediate subcategories / children
+    - Count and sample of product families categorized under this node
+    """
+    def get(self, request, pk=None, *args, **kwargs):
+        cat_id = pk or request.query_params.get('category_id')
+        if not cat_id:
+            return Response({"error": "Category ID is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        category = get_object_or_404(Category, pk=cat_id)
+        parts = [p.strip() for p in category.name.split('>')]
+
+        # Build breadcrumbs
+        breadcrumbs = []
+        acc = []
+        for i, part in enumerate(parts):
+            acc.append(part)
+            path_str = " > ".join(acc)
+            matching_cat = Category.objects.filter(name__iexact=path_str).first()
+            breadcrumbs.append({
+                'level': i + 1,
+                'name': part,
+                'full_path': path_str,
+                'id': matching_cat.id if matching_cat else None
+            })
+
+        # Subcategories (Children)
+        prefix = f"{category.name} > "
+        child_qs = Category.objects.filter(name__startswith=prefix)
+        children = []
+        seen_child_names = set()
+        for child in child_qs:
+            sub = child.name[len(prefix):]
+            child_leaf = sub.split('>')[0].strip()
+            if child_leaf not in seen_child_names:
+                seen_child_names.add(child_leaf)
+                full_child_name = f"{prefix}{child_leaf}"
+                child_cat = Category.objects.filter(name__iexact=full_child_name).first()
+                children.append({
+                    'id': child_cat.id if child_cat else child.id,
+                    'name': child_leaf,
+                    'full_name': full_child_name
+                })
+
+        # Product Families under this category (exact or prefix subcategory match)
+        assigned_families = ProductFamily.objects.filter(
+            Q(predicted_category=category) | Q(predicted_category__name__startswith=prefix)
+        ).order_by('-id')
+        
+        assigned_count = assigned_families.count()
+        sample_families = ProductFamilySerializer(assigned_families[:12], many=True).data
+
+        return Response({
+            'id': category.id,
+            'name': category.name,
+            'depth': len(parts),
+            'breadcrumbs': breadcrumbs,
+            'children': children,
+            'assigned_families_count': assigned_count,
+            'assigned_families': sample_families
+        }, status=status.HTTP_200_OK)
+
