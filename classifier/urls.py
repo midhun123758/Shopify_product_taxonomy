@@ -11,7 +11,9 @@ from .views import (
     PauseProcessingAPIView,
     ResumeProcessingAPIView,
     FamilyDetailAPIView,
-    ProductDetailAPIView
+    ProductDetailAPIView,
+    CategorySearchAPIView,
+    CategoryWayfindAPIView
 )
 
 urlpatterns = [
@@ -25,6 +27,9 @@ urlpatterns = [
     path('products/<int:pk>/', ProductUpdateAPIView.as_view(), name='product_update'),
     path('products/stats/', ProductStatsAPIView.as_view(), name='product_stats'),
     path('categories/main/', MainCategoryListAPIView.as_view(), name='main_categories'),
+    path('categories/search/', CategorySearchAPIView.as_view(), name='category_search'),
+    path('categories/wayfind/', CategoryWayfindAPIView.as_view(), name='category_wayfind'),
+    path('categories/<str:pk>/wayfind/', CategoryWayfindAPIView.as_view(), name='category_wayfind_detail'),
     path('products/pause/', PauseProcessingAPIView.as_view(), name='pause_processing'),
     path('products/resume/', ResumeProcessingAPIView.as_view(), name='resume_processing'),
-]
+]
