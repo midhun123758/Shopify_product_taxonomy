@@ -42,8 +42,8 @@ services:
   worker:
     build: .
     container_name: shopify_worker
-    # Controlled concurrency (4 workers) for high throughput
-    command: celery -A taxonomy_project worker -l INFO --concurrency=4
+    # Concurrency=1 ensures smooth execution without triggering Free Tier 429 Rate Limit retries
+    command: celery -A taxonomy_project worker -l INFO --concurrency=1
     volumes:
       - .:/app
     depends_on:

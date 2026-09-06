@@ -32,12 +32,12 @@ def run_test(product_id=None):
 
     # 1. Fetch Product
     if product_id:
-        product = Product.objects.filter(id=product_id).first()
+        family = ProductFamily.objects.filter(id=product_id).first()
     else:
-        product = Product.objects.filter(status='PENDING').first()
+        family = ProductFamily.objects.filter(status='PENDING').first()
 
-    if not product:
-        print("❌ No PENDING products found in the database to test.")
+    if not family:
+        print("❌ No PENDING families found in the database to test.")
         return
 
     print(f"\n📦 PRODUCT SELECTED:")
@@ -113,12 +113,12 @@ def run_test(product_id=None):
         product.predicted_category = category_match
         product.confidence_score = confidence
         
-        if confidence >= 0.85:
+        if confidence >= 0.86:
             product.status = 'COMPLETED'
-            print("   🟢 [Final Status]: COMPLETED (Confidence >= 85%)")
+            print("   🟢 [Final Status]: COMPLETED (Confidence >= 86%)")
         else:
             product.status = 'MANUAL_REVIEW'
-            print("   🟡 [Final Status]: MANUAL_REVIEW (Confidence < 85%)")
+            print("   🟡 [Final Status]: MANUAL_REVIEW (Confidence < 86%)")
     else:
         print(f"   ❌ [No Database Match]: Could not find a category ending with '{leaf_node}'")
         product.status = 'MANUAL_REVIEW'

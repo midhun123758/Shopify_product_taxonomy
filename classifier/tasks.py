@@ -1,6 +1,8 @@
 import os
-import json
 import re
+import json
+import time
+import logging
 from celery import shared_task
 from django.conf import settings
 from .models import ProductFamily, Category
@@ -136,10 +138,10 @@ Respond ONLY in this exact JSON format:
         response = model.generate_content(payload)
         text = response.text.strip()
 
-        # Clean JSON response if wrapped in markdown codeblocks
-        if text.startswith("```"):
-            text = re.sub(r'^```(?:json)?\s*', '', text)
-            text = re.sub(r'\s*```$', '', text)
+        # Robust JSON extraction to prevent JSONDecodeError if wrapped in markdown or conversational text
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            text = json_match.group(0)
 
         ai_data = json.loads(text)
 
@@ -149,15 +151,22 @@ Respond ONLY in this exact JSON format:
         confidence = float(ai_data.get('confidence', 0.5))
         attributes = ai_data.get('extracted_attributes', {})
 
+        # Multi-tier Category Database Lookup (ID -> Exact Name -> Leaf Node -> Contains)
         category_obj = Category.objects.filter(id=selected_id).first() if selected_id else None
         if not category_obj and selected_name:
             category_obj = Category.objects.filter(name__iexact=selected_name).first()
+        if not category_obj and selected_name:
+            leaf_node = selected_name.split('>')[-1].strip()
+            category_obj = Category.objects.filter(name__iendswith=f"> {leaf_node}").first()
+        if not category_obj and selected_name:
+            leaf_node = selected_name.split('>')[-1].strip()
+            category_obj = Category.objects.filter(name__icontains=leaf_node).first()
 
-        # Build list of top alternative candidate names directly from DB list
+        # Build list of top alternative candidate names directly from candidate DB list
         alt_suggestions = [c[1] for c in candidates if c[0] != selected_id][:4]
 
-        # Validation logic: High confidence (>=0.80) -> COMPLETED, else -> MANUAL_REVIEW
-        if category_obj and confidence >= 0.80:
+        # Validation logic: High confidence (>=0.86) -> COMPLETED, else -> MANUAL_REVIEW
+        if category_obj and confidence >= 0.86:
             status = 'COMPLETED'
         else:
             status = 'MANUAL_REVIEW'
@@ -169,6 +178,10 @@ Respond ONLY in this exact JSON format:
         family.extracted_attributes = attributes
         family.save()
 
+        # Slight pacing pause to stay safely under Gemini 15 RPM Free Tier limit
+        import time
+        time.sleep(2)
+
         return f"Family {family.id} classified as {status} (Category: {category_obj.name if category_obj else 'None'}, Confidence: {confidence})."
 
     except Exception as e:
@@ -176,9 +189,14 @@ Respond ONLY in this exact JSON format:
         error_str = str(e)
         logging.error(f"Gemini RAG API error for family {family.id}: {e}")
 
-        # Dynamic rate limit retry backoff
-        if '429' in error_str:
-            retry_delay = 15 + (self.request.retries * 10)
+        # Dynamic rate limit retry backoff using Google's exact requested delay
+        if '429' in error_str or 'ResourceExhausted' in error_str:
+            retry_delay = 35
+            delay_match = re.search(r'retry\s+in\s+([\d\.]+)', error_str, re.IGNORECASE)
+            if not delay_match:
+                delay_match = re.search(r'retry_delay\s*\{\s*seconds:\s*(\d+)', error_str)
+            if delay_match:
+                retry_delay = int(float(delay_match.group(1))) + 2
             raise self.retry(exc=e, countdown=retry_delay)
 
         # Temporary server error — exponential backoff
