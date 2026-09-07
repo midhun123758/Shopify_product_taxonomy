@@ -13,7 +13,10 @@ from .views import (
     FamilyDetailAPIView,
     ProductDetailAPIView,
     CategorySearchAPIView,
-    CategoryWayfindAPIView
+    CategoryWayfindAPIView,
+    BrandListAPIView,
+    BrandDetailAPIView,
+    ClearDataAPIView
 )
 
 urlpatterns = [
@@ -26,6 +29,9 @@ urlpatterns = [
     path('products/review/', ReviewListAPIView.as_view(), name='review_list'),
     path('products/<int:pk>/', ProductUpdateAPIView.as_view(), name='product_update'),
     path('products/stats/', ProductStatsAPIView.as_view(), name='product_stats'),
+    path('products/clear/', ClearDataAPIView.as_view(), name='clear_data'),
+    path('brands/', BrandListAPIView.as_view(), name='brand_list'),
+    path('brands/detail/', BrandDetailAPIView.as_view(), name='brand_detail'),
     path('categories/main/', MainCategoryListAPIView.as_view(), name='main_categories'),
     path('categories/search/', CategorySearchAPIView.as_view(), name='category_search'),
     path('categories/wayfind/', CategoryWayfindAPIView.as_view(), name='category_wayfind'),

@@ -8,21 +8,6 @@ from django.conf import settings
 from .models import ProductFamily, Category
 import google.generativeai as genai
 
-# Load simplified taxonomy
-TAXONOMY_FILE = os.path.join(settings.BASE_DIR, 'simplified_taxonomy.json')
-with open(TAXONOMY_FILE, 'r') as f:
-    TAXONOMY_DATA = json.load(f)
-
-
-# Build a list of valid category paths for AI matching
-VALID_CATEGORIES = []
-for category_name, subcategories in TAXONOMY_DATA.items():
-    if not subcategories:
-        VALID_CATEGORIES.append(category_name)
-    else:
-        for sub in subcategories:
-            VALID_CATEGORIES.append(f"{category_name} > {sub}")
-
 
 def retrieve_top_category_candidates(product_title: str, product_type: str = '', product_description: str = '', product_brand: str = '', limit: int = 16):
     """

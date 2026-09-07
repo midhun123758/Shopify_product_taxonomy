@@ -38,10 +38,9 @@ class UploadSerializer(serializers.Serializer):
     file = serializers.FileField()
 
 def clean_title(title):
-    # Extremely basic grouping logic for the assignment
     title = str(title).lower().strip()
-    # Remove things like " - black", " - set of 4"
-    title = re.sub(r'\s*-\s*.*$', '', title)
+    # Normalize extra spaces
+    title = re.sub(r'\s+', ' ', title).strip()
     return title
 
 class ImportExcelAPIView(APIView):
@@ -111,23 +110,30 @@ class ImportExcelAPIView(APIView):
             family_map = {f.normalized_title: f for f in family_objs}
             
             # 2. Create individual Products linked to families
+            known_colors = ['black', 'white', 'blue', 'red', 'green', 'yellow', 'brown', 'grey', 'gray', 'pink', 'purple', 'gold', 'silver', 'bronze', 'brass', 'beige', 'cream', 'navy', 'teal', 'tan']
             products_to_create = []
             for row in df.to_dict('records'):
                 raw_sku = str(row.get('sku', '')).strip()
                 final_sku = raw_sku if raw_sku else None
                 family_obj = family_map.get(str(row['normalized_title']))
 
+                title_str = str(row.get('title', ''))
+                color_val = str(row.get('color', '')).strip() if row.get('color') else None
+                if not color_val and '-' in title_str:
+                    possible_color = title_str.split('-')[-1].strip().lower()
+                    if any(kc in possible_color for kc in known_colors):
+                        color_val = title_str.split('-')[-1].strip()
+
                 products_to_create.append(
                     Product(
                         sku=final_sku,
                         family=family_obj,
-                        title=str(row.get('title', '')),
+                        title=title_str,
                         description=str(row.get('description', '')),
                         product_type=str(row.get('product_type', '')),
                         brand=str(row.get('brand', '')),
                         image_url=str(row.get('image_url', '')),
-                        # Extract basic color from title if it exists after dash
-                        color=str(row.get('title', '')).split('-')[-1].strip() if '-' in str(row.get('title', '')) else None
+                        color=color_val
                     )
                 )
 
@@ -147,13 +153,21 @@ class ImportExcelAPIView(APIView):
 
 class ProductFamilyListAPIView(generics.ListAPIView):
     """
-    GET /api/families/
+    GET /api/families/?search=...&status=...
     Returns the grouped families for the UI to display.
     """
     serializer_class = ProductFamilySerializer
 
     def get_queryset(self):
         queryset = ProductFamily.objects.all().order_by('-id')
+        search_param = self.request.query_params.get('search', None)
+        if search_param:
+            queryset = queryset.filter(
+                Q(normalized_title__icontains=search_param) |
+                Q(brand__icontains=search_param) |
+                Q(product_type__icontains=search_param) |
+                Q(predicted_category__name__icontains=search_param)
+            )
         status_param = self.request.query_params.get('status', None)
         if status_param:
             queryset = queryset.filter(status=status_param)
@@ -200,18 +214,18 @@ class ProductUpdateAPIView(APIView):
     serializer_class = ProductUpdateSerializer
 
     def patch(self, request, pk, *args, **kwargs):
-        # We'll adapt this for ProductFamily instead of Product since families hold the status
         family = get_object_or_404(ProductFamily, pk=pk)
         
         category = None
         if 'category_id' in request.data:
-            category = get_object_or_404(Category, id=request.data['category_id'])
+            category = Category.objects.filter(id=request.data['category_id']).first()
         elif 'category_name' in request.data:
-            name = request.data['category_name'].replace('Raw AI Output: ', '').strip()
-            leaf_node = name.split('>')[-1].strip()
-            category = Category.objects.filter(name__iendswith=f"> {leaf_node}").first()
+            name = str(request.data['category_name']).strip()
+            # Exact full name match first
+            category = Category.objects.filter(name__iexact=name).first()
             if not category:
-                category = Category.objects.filter(name__iexact=leaf_node).first()
+                # Substring/icontains fallback
+                category = Category.objects.filter(name__icontains=name).first()
                 
             if not category:
                 return Response({"error": f"Could not find a category matching '{name}'"}, status=status.HTTP_400_BAD_REQUEST)
@@ -222,7 +236,8 @@ class ProductUpdateAPIView(APIView):
             family.save()
             return Response({"message": "Family successfully manually categorized.", "new_category": category.name}, status=status.HTTP_200_OK)
             
-        return Response({"error": "Please provide a category_id or category_name"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"error": "Please provide a valid category_id or category_name"}, status=status.HTTP_400_BAD_REQUEST)
+
 
 class ProductStatsAPIView(APIView):
     def get(self, request, *args, **kwargs):
@@ -255,6 +270,37 @@ class ResumeProcessingAPIView(APIView):
             return Response({"message": "AI Processing RESUMED. Started background batch classification for pending families."}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class ClearDataAPIView(APIView):
+    """
+    POST /api/products/clear/
+    Wipes all Product and ProductFamily records from DB and flushes Celery task queues in Redis.
+    """
+    def post(self, request, *args, **kwargs):
+        try:
+            p_deleted, _ = Product.objects.all().delete()
+            f_deleted, _ = ProductFamily.objects.all().delete()
+            
+            redis_msg = "Redis queue cleared."
+            try:
+                try:
+                    r = redis.Redis(host='redis', port=6379, db=0)
+                    r.flushdb()
+                except Exception:
+                    r = redis.Redis(host='localhost', port=6379, db=0)
+                    r.flushdb()
+            except Exception as re:
+                redis_msg = f"Redis queue warning: {re}"
+
+            return Response({
+                "message": "Product data and Redis queue successfully wiped.",
+                "deleted_products": p_deleted,
+                "deleted_families": f_deleted,
+                "redis_status": redis_msg
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 
 class FamilyDetailAPIView(APIView):
@@ -354,37 +400,42 @@ class CategoryWayfindAPIView(APIView):
         category = get_object_or_404(Category, pk=cat_id)
         parts = [p.strip() for p in category.name.split('>')]
 
-        # Build breadcrumbs
+        # Build breadcrumbs in single bulk DB query
+        path_strs = [" > ".join(parts[:i+1]) for i in range(len(parts))]
+        matching_cats = {c.name.lower(): c.id for c in Category.objects.filter(name__in=path_strs)}
+
         breadcrumbs = []
-        acc = []
         for i, part in enumerate(parts):
-            acc.append(part)
-            path_str = " > ".join(acc)
-            matching_cat = Category.objects.filter(name__iexact=path_str).first()
+            full_path = path_strs[i]
             breadcrumbs.append({
                 'level': i + 1,
                 'name': part,
-                'full_path': path_str,
-                'id': matching_cat.id if matching_cat else None
+                'full_path': full_path,
+                'id': matching_cats.get(full_path.lower())
             })
 
-        # Subcategories (Children)
+        # Subcategories (Children) in single bulk DB query
         prefix = f"{category.name} > "
         child_qs = Category.objects.filter(name__startswith=prefix)
-        children = []
-        seen_child_names = set()
+        seen_child_leaves = {}
         for child in child_qs:
             sub = child.name[len(prefix):]
             child_leaf = sub.split('>')[0].strip()
-            if child_leaf not in seen_child_names:
-                seen_child_names.add(child_leaf)
+            if child_leaf not in seen_child_leaves:
                 full_child_name = f"{prefix}{child_leaf}"
-                child_cat = Category.objects.filter(name__iexact=full_child_name).first()
-                children.append({
-                    'id': child_cat.id if child_cat else child.id,
-                    'name': child_leaf,
-                    'full_name': full_child_name
-                })
+                seen_child_leaves[child_leaf] = full_child_name
+
+        child_full_names = list(seen_child_leaves.values())
+        matching_child_cats = {c.name.lower(): c.id for c in Category.objects.filter(name__in=child_full_names)}
+
+        children = []
+        for child_leaf, full_child_name in seen_child_leaves.items():
+            cat_id_found = matching_child_cats.get(full_child_name.lower(), category.id)
+            children.append({
+                'id': cat_id_found,
+                'name': child_leaf,
+                'full_name': full_child_name
+            })
 
         # Product Families under this category (exact or prefix subcategory match)
         assigned_families = ProductFamily.objects.filter(
@@ -403,4 +454,102 @@ class CategoryWayfindAPIView(APIView):
             'assigned_families_count': assigned_count,
             'assigned_families': sample_families
         }, status=status.HTTP_200_OK)
+
+
+class BrandListAPIView(APIView):
+    """
+    GET /api/brands/
+    Returns a grouped list of all distinct product brands in the database,
+    along with product counts, family counts, and sample products.
+    """
+    def get(self, request, *args, **kwargs):
+        from django.db.models import Q
+        
+        families = ProductFamily.objects.all().select_related('predicted_category')
+        
+        brand_map = {}
+        for f in families:
+            b_name = (f.brand or '').strip()
+            if not b_name:
+                b_name = 'Unbranded'
+            
+            if b_name not in brand_map:
+                brand_map[b_name] = {
+                    'brand_name': b_name,
+                    'total_families': 0,
+                    'completed_families': 0,
+                    'total_products': 0,
+                    'categories': set(),
+                    'sample_products': []
+                }
+            
+            brand_map[b_name]['total_families'] += 1
+            if f.status == 'COMPLETED':
+                brand_map[b_name]['completed_families'] += 1
+            if f.predicted_category:
+                brand_map[b_name]['categories'].add(f.predicted_category.name.split('>')[-1].strip())
+
+        all_products = Product.objects.all().select_related('family')
+        for p in all_products:
+            b_name = (p.brand or (p.family.brand if p.family else '') or '').strip()
+            if not b_name:
+                b_name = 'Unbranded'
+            
+            if b_name in brand_map:
+                brand_map[b_name]['total_products'] += 1
+                if len(brand_map[b_name]['sample_products']) < 6:
+                    brand_map[b_name]['sample_products'].append({
+                        'id': p.id,
+                        'title': p.title,
+                        'sku': p.sku,
+                        'image_url': p.image_url,
+                        'color': p.color,
+                        'product_type': p.product_type
+                    })
+
+        result = []
+        for b_name, data in brand_map.items():
+            result.append({
+                'brand_name': data['brand_name'],
+                'total_families': data['total_families'],
+                'completed_families': data['completed_families'],
+                'total_products': data['total_products'],
+                'categories': list(data['categories'])[:5],
+                'sample_products': data['sample_products']
+            })
+
+        result.sort(key=lambda x: x['total_products'], reverse=True)
+        return Response(result, status=status.HTTP_200_OK)
+
+
+class BrandDetailAPIView(APIView):
+    """
+    GET /api/brands/detail/?brand=...
+    Returns full product family and product list for a specific brand.
+    """
+    def get(self, request, *args, **kwargs):
+        from django.db.models import Q
+        brand_name = request.query_params.get('brand', '').strip()
+        if not brand_name:
+            return Response({"error": "Brand query parameter is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if brand_name.lower() == 'unbranded':
+            families = ProductFamily.objects.filter(Q(brand__isnull=True) | Q(brand='') | Q(brand__iexact='unbranded'))
+            products = Product.objects.filter(Q(brand__isnull=True) | Q(brand='') | Q(brand__iexact='unbranded'))
+        else:
+            families = ProductFamily.objects.filter(brand__iexact=brand_name)
+            products = Product.objects.filter(brand__iexact=brand_name)
+
+        families_data = ProductFamilySerializer(families, many=True).data
+        products_data = ProductSerializer(products, many=True).data
+
+        return Response({
+            'brand_name': brand_name,
+            'total_families': families.count(),
+            'total_products': products.count(),
+            'families': families_data,
+            'products': products_data
+        }, status=status.HTTP_200_OK)
+
+
 
