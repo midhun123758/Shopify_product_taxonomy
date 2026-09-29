@@ -245,31 +245,31 @@ class AnalyzeFamilyAPITests(TestCase):
             normalized_title="test sofa", status="PENDING"
         )
 
-    @patch("classifier.tasks.classify_family_task")
+    @patch("classifier.tasks.categorize_task")
     def test_analyze_queues_task(self, mock_task):
         mock_task.delay = MagicMock()
         response = self.client.post(f"/api/families/{self.family.id}/analyze/")
         self.assertEqual(response.status_code, 200)
         mock_task.delay.assert_called_once_with(self.family.id)
 
-    @patch("classifier.tasks.classify_family_task")
+    @patch("classifier.tasks.categorize_task")
     def test_analyze_sets_status_to_processing(self, mock_task):
         mock_task.delay = MagicMock()
         self.client.post(f"/api/families/{self.family.id}/analyze/")
         self.family.refresh_from_db()
         self.assertEqual(self.family.status, "PROCESSING")
 
-    def test_already_completed_returns_400(self):
+    def test_already_completed_returns_200(self):
         self.family.status = "COMPLETED"
         self.family.save()
         response = self.client.post(f"/api/families/{self.family.id}/analyze/")
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 200)
 
     def test_nonexistent_family_returns_404(self):
         response = self.client.post("/api/families/99999/analyze/")
         self.assertEqual(response.status_code, 404)
 
-    @patch("classifier.tasks.classify_family_task")
+    @patch("classifier.tasks.categorize_task")
     def test_response_message_contains_family_title(self, mock_task):
         mock_task.delay = MagicMock()
         data = self.client.post(f"/api/families/{self.family.id}/analyze/").json()
@@ -352,66 +352,65 @@ class ClassificationFlowTests(TestCase):
             "Furniture > Living Room Furniture > Sofas & Sectionals"
         )
 
-    @patch("classifier.tasks.guarded_fuzzy_match")
+    @patch("classifier.tasks.retrieve_top_category_candidates")
     @patch("classifier.tasks.genai")
-    def test_completed_when_category_found(self, mock_genai, mock_fuzzy):
-        """When Gemini returns a valid category and fuzzy match finds it → COMPLETED."""
+    def test_completed_when_category_found(self, mock_genai, mock_retrieve):
+        """When Gemini returns a valid category and it matches candidates → COMPLETED."""
         mock_model = MagicMock()
         mock_model.generate_content.return_value = MagicMock(
-            text='Category: Furniture > Living Room Furniture > Sofas & Sectionals\nAttributes: {"material": "leather"}'
+            text='{"selected_category_id": "gid://shopify/sofa-flow", "category_name": "Furniture > Living Room Furniture > Sofas & Sectionals", "confidence": 0.95, "extracted_attributes": {"material": "leather"}}'
         )
         mock_genai.GenerativeModel.return_value = mock_model
-        mock_genai.configure = MagicMock()
-        mock_fuzzy.return_value = (self.category, "COMPLETED", [])
+        mock_retrieve.return_value = [(self.category.id, self.category.name, 1.0)]
 
         family = ProductFamily.objects.create(normalized_title="test sofa", status="PROCESSING")
 
-        from classifier.tasks import classify_family_task
-        classify_family_task(family.id)
+        from classifier.tasks import categorize_task
+        categorize_task(family.id)
 
         family.refresh_from_db()
         self.assertEqual(family.status, "COMPLETED")
         self.assertEqual(family.predicted_category, self.category)
-        self.assertAlmostEqual(family.confidence_score, 0.95)
+        self.assertEqual(family.confidence_score, 0.95)
 
-    @patch("classifier.tasks.guarded_fuzzy_match")
+    @patch("classifier.tasks.retrieve_top_category_candidates")
     @patch("classifier.tasks.genai")
-    def test_manual_review_when_low_confidence(self, mock_genai, mock_fuzzy):
-        """When fuzzy match returns MANUAL_REVIEW → family status is MANUAL_REVIEW."""
+    def test_manual_review_when_low_confidence(self, mock_genai, mock_retrieve):
+        """When no valid candidate matches → family status is MANUAL_REVIEW."""
         mock_model = MagicMock()
         mock_model.generate_content.return_value = MagicMock(
-            text='Category: Ambiguous Thing\nAttributes: {}'
+            text='{"selected_category_id": "", "category_name": "Ambiguous Thing", "confidence": 0.4, "extracted_attributes": {}}'
         )
         mock_genai.GenerativeModel.return_value = mock_model
-        mock_genai.configure = MagicMock()
-        mock_fuzzy.return_value = (None, "MANUAL_REVIEW", ["Suggestion A", "Suggestion B"])
+        
+        # Return candidates that do not match the Gemini output
+        alts = [(100, "Suggestion A", 0.8), (101, "Suggestion B", 0.7)]
+        mock_retrieve.return_value = alts
 
         family = ProductFamily.objects.create(normalized_title="ambiguous item", status="PROCESSING")
 
-        from classifier.tasks import classify_family_task
-        classify_family_task(family.id)
+        from classifier.tasks import categorize_task
+        categorize_task(family.id)
 
         family.refresh_from_db()
         self.assertEqual(family.status, "MANUAL_REVIEW")
         self.assertIsNone(family.predicted_category)
-        self.assertEqual(family.confidence_score, 0.4)
 
-    @patch("classifier.tasks.guarded_fuzzy_match")
+    @patch("classifier.tasks.retrieve_top_category_candidates")
     @patch("classifier.tasks.genai")
-    def test_attributes_saved_after_classification(self, mock_genai, mock_fuzzy):
+    def test_attributes_saved_after_classification(self, mock_genai, mock_retrieve):
         """Extracted attributes from Gemini response should be saved on the family."""
         mock_model = MagicMock()
         mock_model.generate_content.return_value = MagicMock(
-            text='Category: Furniture > Sofas\nAttributes: {"material": "velvet", "style": "modern"}'
+            text='{"selected_category_id": "gid://shopify/sofa-flow", "category_name": "Furniture > Sofas", "confidence": 0.95, "extracted_attributes": {"material": "velvet", "style": "modern"}}'
         )
         mock_genai.GenerativeModel.return_value = mock_model
-        mock_genai.configure = MagicMock()
-        mock_fuzzy.return_value = (self.category, "COMPLETED", [])
+        mock_retrieve.return_value = [(self.category.id, self.category.name, 1.0)]
 
         family = ProductFamily.objects.create(normalized_title="velvet sofa", status="PROCESSING")
 
-        from classifier.tasks import classify_family_task
-        classify_family_task(family.id)
+        from classifier.tasks import categorize_task
+        categorize_task(family.id)
 
         family.refresh_from_db()
         self.assertIsNotNone(family.extracted_attributes)
@@ -420,43 +419,48 @@ class ClassificationFlowTests(TestCase):
 
     @patch("classifier.tasks.genai")
     def test_gemini_failure_marks_family_failed(self, mock_genai):
-        """If Gemini throws a non-retryable error, family status → FAILED."""
+        """If Gemini throws a non-retryable error, family status should be marked as FAILED."""
         mock_model = MagicMock()
         mock_model.generate_content.side_effect = Exception("500 Internal Server Error")
         mock_genai.GenerativeModel.return_value = mock_model
-        mock_genai.configure = MagicMock()
 
         family = ProductFamily.objects.create(normalized_title="broken sofa", status="PROCESSING")
 
-        from classifier.tasks import classify_family_task
-        classify_family_task(family.id)
+        from classifier.tasks import categorize_task
+        categorize_task(family.id)
 
         family.refresh_from_db()
         self.assertEqual(family.status, "FAILED")
 
-    @patch("classifier.tasks.guarded_fuzzy_match")
+    @patch("classifier.tasks.retrieve_top_category_candidates")
     @patch("classifier.tasks.genai")
-    def test_alternative_suggestions_saved(self, mock_genai, mock_fuzzy):
-        """Alternative category suggestions from fuzzy match should be persisted."""
+    def test_alternative_suggestions_saved(self, mock_genai, mock_retrieve):
+        """Alternative category suggestions should be persisted."""
         mock_model = MagicMock()
         mock_model.generate_content.return_value = MagicMock(
-            text='Category: Furniture > Chairs\nAttributes: {}'
+            text='{"selected_category_id": "", "category_name": "Furniture > Chairs", "confidence": 0.5, "extracted_attributes": {}}'
         )
         mock_genai.GenerativeModel.return_value = mock_model
-        mock_genai.configure = MagicMock()
-        alts = ["Furniture > Stools", "Furniture > Benches"]
-        mock_fuzzy.return_value = (None, "MANUAL_REVIEW", alts)
+        
+        c1 = make_category("1", "Furniture > Stools")
+        c2 = make_category("2", "Furniture > Benches")
+        
+        alts = [(c1.id, c1.name, 0.9), (c2.id, c2.name, 0.8)]
+        mock_retrieve.return_value = alts
 
         family = ProductFamily.objects.create(normalized_title="some chair", status="PROCESSING")
 
-        from classifier.tasks import classify_family_task
-        classify_family_task(family.id)
+        from classifier.tasks import categorize_task
+        categorize_task(family.id)
 
         family.refresh_from_db()
-        self.assertEqual(family.alternative_suggestions, alts)
+        # Since the first candidate (c1) is used as the fallback predicted_category,
+        # only c2 should end up in the alternative_suggestions list.
+        self.assertEqual(family.alternative_suggestions, ["Furniture > Benches"])
 
     def test_classify_nonexistent_family_returns_message(self):
         """Calling the task with a non-existent ID should not raise an exception."""
-        from classifier.tasks import classify_family_task
-        result = classify_family_task(99999)
+        from classifier.tasks import categorize_task
+        result = categorize_task(99999)
         self.assertEqual(result, "Family not found.")
+

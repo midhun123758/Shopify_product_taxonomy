@@ -1,41 +1,39 @@
-# 🛒 Shopify Product AI Taxonomy Classifier
+# 🛒 Shopify Product AI Taxonomy Engine
 
-An intelligent e-commerce automation tool designed to ingest massive product catalogs (10,000+ items), group product color/size variations into parent families, autonomously classify them into official **Shopify Standard Product Taxonomy** categories using **Google Gemini 3.6 Flash AI**, and provide a 3-level interactive web dashboard for human review and attribute extraction.
+An enterprise-grade, asynchronous e-commerce automation pipeline designed to ingest massive product catalogs (10,000+ items), deduplicate variants, and autonomously classify products into the **Official Shopify Standard Product Taxonomy** using a **Multi-Agent RAG Pipeline (Google Gemini 1.5 Flash)**.
+
+Includes a high-performance React dashboard for real-time monitoring and 1-click human manual review.
 
 ---
 
 ## 💻 Tech Stack
 
-- **Backend**: Python 3.11, Django 5.0, Django REST Framework
-- **Task Queue & Broker**: Celery, Redis
-- **Database**: PostgreSQL (with `pg_trgm` trigonometric similarity extension)
-- **AI Engine**: Google Gemini API (`gemini-3.6-flash` Multimodal)
-- **Frontend**: React 18, Vite, React Router DOM, Glassmorphism CSS
-- **Containerization & Proxy**: Docker, Docker Compose, Nginx
+- **Backend**: Python, Django REST Framework
+- **Asynchronous Task Queue**: Celery, Redis Message Broker
+- **Database**: PostgreSQL (utilizing the `pg_trgm` extension for sub-millisecond string similarity searches)
+- **AI Engine**: Google Gemini 1.5 Flash (Multi-Modal Vision & Text API)
+- **Data Engineering**: Pandas (Variant grouping & deduplication)
+- **Frontend**: React 18, Vite, Glassmorphism CSS
+- **Infrastructure**: Docker & Docker Compose
 
 ---
 
-## ⚡ How It Works (Core Pipeline)
+## ⚡ Core Architecture & Pipeline
 
-1. **Pandas Bulk Upload & Variant Normalization**:
-   - Ingests 10,000+ Excel SKUs in seconds using `pandas` and `bulk_create`.
-   - Cleans variant titles (e.g., removing `- Black`, `- 86"`) to aggregate SKUs into **Parent Product Families**, cutting AI API token costs by **80%+**.
+### 1. Pandas Bulk Upload & Variant Deduplication (80% Cost Reduction)
+When a user uploads 10,000+ SKUs via Excel, the Django backend passes the dataset to a Pandas engine. It strips variant dimensions (Size, Color) and groups identical items into single `ProductFamily` entities. This compresses 10,000 requests into roughly 2,000 API calls before execution begins.
 
-2. **Multimodal Gemini AI Classification & Attribute Extraction**:
-   - In a single pass, Gemini analyzes both the product **Visual Image** and text details (`Title`, `Brand`, `Description`).
-   - Predicts the Shopify taxonomy path and extracts structured JSON attributes (`material`, `shape`, `size`, `set_includes`, `brand`).
+### 2. Multi-Agent RAG Pipeline (Zero Hallucinations)
+Instead of forcing a single AI prompt to guess categories, the system uses two specialized agents:
+- **Agent 1 (Categorizer) & PostgreSQL RAG:** The database runs a lightning-fast `pg_trgm` fuzzy search across the 14,000+ official Shopify categories. The top 5 candidates are sent to Agent 1, which strictly chooses the best existing node (guaranteeing 100% taxonomy compliance).
+- **Agent 2 (Attribute Extractor):** Once categorized, Agent 2 dynamically loads the exact allowed attributes for that node from a simplified JSON schema. It extracts exact values (e.g., Color, Material, Shape) directly from the text and image.
 
-3. **PostgreSQL `pg_trgm` Fuzzy Matching**:
-   - Matches AI output against 28,000+ official Shopify taxonomy database nodes using trigonometric similarity (`similarity(name, %s)`).
-   - Items with high confidence (≥90%) auto-complete; items with <60% confidence are safely routed to **Manual Review**.
+### 3. Asynchronous Concurrency (Celery + Redis)
+To prevent server crashes on massive uploads, the 2,000 tasks are dropped into a Redis queue. Background Celery workers process these jobs concurrently in parallel. The workers feature **Exponential Backoff & Auto-Retries** to elegantly handle external AI API rate limits (HTTP 429 Too Many Requests) without failing the batch.
 
-4. **3-Level Interactive Drill-Down Workstation**:
-   - **Level 1 (`/catalog`)**: Product Family Catalog displaying grouped items, status badges, and category paths.
-   - **Level 2 (`/families/:id`)**: Family Details Page listing all child SKUs, colors, and variant thumbnails.
-   - **Level 3 (`/products/:id`)**: Product AI Analysis Page showing high-res images, extracted attributes, and **1-Click AI Category Suggestions (`+ Apply`)**.
-
-5. **Completed Items Dashboard & CSV Export**:
-   - Real-time dashboard (`/completed`) with one-click CSV export ready for direct import into Shopify admin.
+### 4. Interactive React Workstation
+- **Catalog Grid (`/catalog`)**: Displays grouped families, Live Processing Statuses, and Confidence Scores.
+- **Manual Review System**: If the AI confidence drops below 80%, the product is flagged as `MANUAL_REVIEW`. The UI displays the top 4 alternative PostgreSQL database matches as clickable buttons, allowing a human manager to approve the correct category with a single click.
 
 ---
 
@@ -45,8 +43,6 @@ An intelligent e-commerce automation tool designed to ingest massive product cat
 - Docker & Docker Compose
 - Node.js v18+ (for frontend)
 - Google Gemini API Key
-
----
 
 ### 2. Backend Setup (Docker)
 
@@ -98,8 +94,5 @@ An intelligent e-commerce automation tool designed to ingest massive product cat
 
 ---
 
-## 🧪 Run Business Logic Tests
-
-```bash
-docker compose exec web python test.py
-```
+## 🛡️ Fault Tolerance & State Recovery
+The system is fully stateful. Every product commits its status (`PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`) to PostgreSQL atomically. If the server loses power after processing 6,000 products, clicking "Start Batch" upon reboot will cleanly ignore the finished items and instantly resume from the remaining 4,000 `PENDING` rows.

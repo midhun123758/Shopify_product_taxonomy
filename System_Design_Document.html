@@ -1,0 +1,114 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <title>System Design Document</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; max-width: 900px; margin: 40px auto; padding: 20px; }
+        h1, h2, h3 { color: #008060; }
+        h1 { border-bottom: 2px solid #008060; padding-bottom: 10px; }
+        h2 { border-bottom: 1px solid #ccc; padding-bottom: 5px; margin-top: 30px; }
+        table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        th { background-color: #f4f6f8; color: #333; }
+        code { background-color: #f4f4f4; padding: 2px 5px; border-radius: 4px; font-family: monospace; }
+        pre { background-color: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>System Design Document: Shopify AI Taxonomy Engine</h1>
+
+    <h2>1. Executive Summary</h2>
+    <p>The Shopify AI Taxonomy Engine is a distributed, full-stack application designed to autonomously classify raw e-commerce product data into official Shopify categories. The system utilizes advanced PostgreSQL string searching, a Multi-Agent LLM pipeline (Google Gemini 1.5 Flash), and asynchronous Celery background workers to process massive datasets (10,000+ products) rapidly and accurately, without hallucinating invalid categories.</p>
+
+    <h2>2. Technology Stack</h2>
+    <ul>
+        <li><strong>Frontend:</strong> React 18 (Vite), Vanilla CSS (Glassmorphism UI)</li>
+        <li><strong>Backend Framework:</strong> Django REST Framework (Python)</li>
+        <li><strong>Database:</strong> PostgreSQL (with <code>pg_trgm</code> extension for fuzzy searching)</li>
+        <li><strong>Data Processing:</strong> Pandas (for variant deduplication)</li>
+        <li><strong>Async Engine:</strong> Celery + Redis</li>
+        <li><strong>AI Engine:</strong> Google Gemini 1.5 Flash (Multi-Modal Vision + Text)</li>
+        <li><strong>Infrastructure:</strong> Docker & Docker Compose</li>
+    </ul>
+
+    <h2>3. Requirements Mapping</h2>
+    <table>
+        <tr>
+            <th>#</th>
+            <th>Requirement</th>
+            <th>Architectural Solution</th>
+        </tr>
+        <tr>
+            <td><strong>1</strong></td>
+            <td>Imports the provided product list.</td>
+            <td>The frontend features a Drag & Drop UI that passes the Excel file to the Django API, which uses <code>pandas.read_excel()</code> to parse the rows.</td>
+        </tr>
+        <tr>
+            <td><strong>2</strong></td>
+            <td>Uses Shopify taxonomy to identify category.</td>
+            <td>Implemented a <strong>Multi-Agent RAG Pipeline</strong>. PostgreSQL <code>pg_trgm</code> retrieves the top 5 official categories, and Agent 1 selects the most accurate one.</td>
+        </tr>
+        <tr>
+            <td><strong>3</strong></td>
+            <td>Detects relevant category attributes and values.</td>
+            <td>Agent 2 dynamically loads the exact required attributes for the chosen category from <code>simplified_taxonomy.json</code> and extracts values via a strict JSON schema prompt.</td>
+        </tr>
+        <tr>
+            <td><strong>4</strong></td>
+            <td>Supports products with and without images.</td>
+            <td>Uses Google Gemini Vision. Celery downloads the image to memory. If an image is missing, the code gracefully falls back to a text-only prompt payload.</td>
+        </tr>
+        <tr>
+            <td><strong>5</strong></td>
+            <td>Handles missing descriptions.</td>
+            <td>The Pandas normalizer handles NaN values safely. The pipeline relies heavily on the <code>normalized_title</code> and <code>product_type</code> to retrieve accurate Trigram matches.</td>
+        </tr>
+        <tr>
+            <td><strong>6</strong></td>
+            <td>Uses title, description, type, brand, and image.</td>
+            <td>All available variables are dynamically injected into a comprehensive <code>product_context</code> string within the Gemini prompt template.</td>
+        </tr>
+        <tr>
+            <td><strong>7</strong></td>
+            <td>Provides a confidence score.</td>
+            <td>Agent 1 returns a float (0.0 to 1.0). If the AI's string perfectly matches the database candidate, the system deterministically overrides confidence to 0.98.</td>
+        </tr>
+        <tr>
+            <td><strong>8</strong></td>
+            <td>Provides alternative suggestions.</td>
+            <td>The top 4 unused RAG candidate strings are saved to a <code>JSONB</code> column (<code>alternative_suggestions</code>) and displayed as clickable buttons in the UI for 1-click manual overrides.</td>
+        </tr>
+        <tr>
+            <td><strong>9</strong></td>
+            <td>Identifies products for manual review.</td>
+            <td>If the final confidence score falls below 80%, the product status is flagged as <code>MANUAL_REVIEW</code> and badged yellow in the Dashboard.</td>
+        </tr>
+        <tr>
+            <td><strong>10</strong></td>
+            <td>Processes in batches (10,000+ products).</td>
+            <td>Pandas groups variants into unique families (80% reduction). Celery/Redis dispatches items to concurrent background workers, executing in parallel without freezing the web server.</td>
+        </tr>
+        <tr>
+            <td><strong>11</strong></td>
+            <td>Handles failures without stopping process.</td>
+            <td>Image requests have a strict 5-second timeout. Gemini 429 errors trigger Celery's exponential backoff/retry. The DB tracks status, allowing instant resume after crashes.</td>
+        </tr>
+        <tr>
+            <td><strong>12</strong></td>
+            <td>Simple interface to view/update results.</td>
+            <td>A modern React Dashboard provides data grids, status filters, and specific "Drill-Down" detail pages where human managers can review and override AI categorizations with a single click.</td>
+        </tr>
+    </table>
+
+    <h2>4. Database Schema (PostgreSQL)</h2>
+    <ul>
+        <li><strong>Category:</strong> <code>id</code> (Primary Key), <code>name</code> (Indexed with pg_trgm), <code>parent</code> (Self-referential).</li>
+        <li><strong>ProductFamily:</strong> <code>id</code>, <code>normalized_title</code>, <code>status</code>, <code>predicted_category</code>, <code>confidence_score</code>, <code>extracted_attributes</code> (JSONB), <code>alternative_suggestions</code> (JSONB).</li>
+        <li><strong>Product:</strong> <code>sku</code> (Primary Key), <code>family</code> (ForeignKey), <code>title</code>, <code>description</code>, <code>image_url</code>.</li>
+    </ul>
+
+    <h2>5. Scalability & Fault Tolerance</h2>
+    <p><strong>Rate Limiting Protection:</strong> Firing 10,000 tasks instantly would result in immediate API bans. The Celery worker is configured to catch 429 ResourceExhausted errors, reads the Google retry_delay header, and utilizes Celery's exponential backoff. This ensures the queue safely pauses and self-heals when throttled.</p>
+    <p><strong>Catastrophic Crash Recovery:</strong> Because the system is stateful, every ProductFamily explicitly commits its state to the database. If a server loses power halfway through a batch of 10,000, all completed items are safely saved. Rebooting cleanly ignores the finished items and instantly resumes execution exactly where it died.</p>
+</body>
+</html>

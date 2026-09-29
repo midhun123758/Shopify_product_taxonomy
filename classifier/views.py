@@ -39,6 +39,11 @@ class UploadSerializer(serializers.Serializer):
 
 def clean_title(title):
     title = str(title).lower().strip()
+    
+    # Strip common variant suffixes separated by a dash (e.g. "Sofa - White")
+    if ' - ' in title:
+        title = title.split(' - ')[0].strip()
+        
     # Normalize extra spaces
     title = re.sub(r'\s+', ' ', title).strip()
     return title
@@ -184,8 +189,8 @@ class AnalyzeFamilyAPIView(APIView):
         family.save()
         
         # Trigger celery just for this family ID
-        from .tasks import classify_family_task
-        classify_family_task.delay(family.id)
+        from .tasks import categorize_task
+        categorize_task.delay(family.id)
         
         return Response({"message": f"Family '{family.normalized_title}' queued for AI classification."}, status=status.HTTP_200_OK)
 

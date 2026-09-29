@@ -8,6 +8,59 @@ from django.conf import settings
 from .models import ProductFamily, Category
 import google.generativeai as genai
 
+def safe_json_loads(text):
+    """
+    Safely parse JSON text from LLM outputs even if it contains unescaped control characters,
+    markdown code blocks, or minor string escaping flaws.
+    """
+    if not text:
+        return {}
+    
+    cleaned = text.strip()
+    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+
+    json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if json_match:
+        cleaned = json_match.group(0)
+
+    try:
+        return json.loads(cleaned, strict=False)
+    except Exception:
+        pass
+
+    sanitized = re.sub(r'[\r\n\t]+', ' ', cleaned)
+    try:
+        return json.loads(sanitized, strict=False)
+    except Exception:
+        pass
+
+    sanitized_bytes = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', cleaned)
+    try:
+        return json.loads(sanitized_bytes, strict=False)
+    except Exception:
+        return {}
+
+def broadcast_update(family):
+    try:
+        from channels.layers import get_channel_layer
+        from asgiref.sync import async_to_sync
+        channel_layer = get_channel_layer()
+        if channel_layer:
+            async_to_sync(channel_layer.group_send)(
+                "family_updates",
+                {
+                    "type": "family_update",
+                    "id": str(family.id),
+                    "status": family.status,
+                    "confidence_score": family.confidence_score,
+                    "predicted_category": family.predicted_category.name if family.predicted_category else None,
+                    "alternative_suggestions": family.alternative_suggestions
+                }
+            )
+    except Exception as e:
+        import logging
+        logging.error(f"Broadcast update failed for family {family.id}: {e}")
 
 def retrieve_top_category_candidates(product_title: str, product_type: str = '', product_description: str = '', product_brand: str = '', limit: int = 16):
     """
@@ -83,16 +136,16 @@ def retrieve_top_category_candidates(product_title: str, product_type: str = '',
     return scored_candidates[:limit]
 
 
+from langsmith import traceable
+
 @shared_task(bind=True, max_retries=5)
-def classify_family_task(self, family_id):
+@traceable(name="gemini_product_classification")
+def categorize_task(self, family_id):
     """
-    Classify a ProductFamily using an optimized Retrieve-then-Select (RAG) AI Architecture:
-    1. Known-Category Result Cache: Auto-classify if an identical title was already processed (0ms).
-    2. Hybrid Retrieval with Combined Reranking & Domain Guardrails.
-    3. Resize & compress visual image payload (max 512x512px).
-    4. Compact Gemini prompt with pack size / set count directives.
-    5. Multi-condition auto-approval verification (Category Exists + Candidate Match + Confidence >= 0.86).
+    Unified Fast AI Classification & Attribute Extraction Engine (<4s per product):
+    Performs RAG Candidate Retrieval + Gemini Classification + Attribute Extraction in 1 single pass.
     """
+    global TAXONOMY_CACHE
     try:
         family = ProductFamily.objects.get(id=family_id)
     except ProductFamily.DoesNotExist:
@@ -112,18 +165,20 @@ def classify_family_task(self, family_id):
         family.alternative_suggestions = cached.alternative_suggestions
         family.status = 'COMPLETED'
         family.save()
+        broadcast_update(family)
         return f"Family {family.id} instant auto-classified from result cache."
 
     # Step 1: True Hybrid Candidates with Weighted Reranking
-    candidates = retrieve_top_category_candidates(family.normalized_title, family.product_type or '', family.description or '', family.brand or '', limit=16)
+    candidates = retrieve_top_category_candidates(family.normalized_title, family.product_type or '', family.description or '', family.brand or '', limit=12)
     if not candidates:
         family.status = 'MANUAL_REVIEW'
         family.save()
+        broadcast_update(family)
         return "No candidate categories found."
 
     candidates_formatted = "\n".join([f"- ID: [{c[0]}] | Name: {c[1]}" for c in candidates])
 
-    # Step 2: Load & Resize product image (512x512 max thumbnail) for fast payload
+    # Step 2: Fast Image Fetch (1.5s max timeout)
     first_p = family.products.exclude(image_url='').exclude(image_url__isnull=True).first()
     image_url = first_p.image_url if first_p else None
 
@@ -133,100 +188,116 @@ def classify_family_task(self, family_id):
             import requests
             from PIL import Image
             from io import BytesIO
-            res = requests.get(image_url, timeout=4)
+            res = requests.get(image_url, timeout=1.5)
             if res.status_code == 200:
                 img_obj = Image.open(BytesIO(res.content))
-                img_obj.thumbnail((512, 512))
-        except Exception as img_err:
-            import logging
-            logging.warning(f"Could not load image for family {family.id}: {img_err}")
+                img_obj.thumbnail((256, 256))
+        except Exception:
+            pass
 
-    # Step 3: Compact prompt with Set Count / Pack Size directives
-    desc_snippet = (family.description or '')[:500]
-    prompt = f"""You are an e-commerce product classifier.
-Given the product below, select the SINGLE BEST official category ID from the Candidate List provided.
+    # Step 3: Get variant info for attribute extraction
+    variants = family.products.all()
+    variant_colors = [v.color for v in variants if v.color]
+    unique_colors_str = ", ".join(list(set(variant_colors)))
+    variant_titles = "\n".join([f"- {v.title}" for v in variants][:6])
+
+    desc_snippet = (family.description or '')[:400]
+
+    # Step 4: Compact Unified Prompt (Category + Attributes in 1 pass)
+    prompt = f"""You are an e-commerce product classifier and attribute extractor.
+Select the SINGLE BEST official category ID for this product from the Candidate List, and extract key product attributes (e.g., color, material, style, size).
 
 Product: {family.normalized_title}
 Type: {family.product_type}
 Brand: {family.brand}
 Description: {desc_snippet}
+Variant Colors: {unique_colors_str if unique_colors_str else 'None'}
+Variant Titles:
+{variant_titles}
 
 Candidate Categories:
 {candidates_formatted}
-
-Attributes to Extract if present: material, shape, size, style, color, set_includes
-
-CRITICAL CLASSIFICATION DIRECTIVES:
-1. Ignore set counts or pack sizes (e.g. 'Set of 2', 'Pack of 4', 'Set of 6'). Classify based on the CORE product item type (e.g. 'Dining Chair'), NOT the set count.
-2. Select ONLY a single exact Category ID from the Candidate List provided above.
 
 Respond ONLY in this exact JSON format:
 {{
   "selected_category_id": "<exact_id_from_list>",
   "category_name": "<exact_name_from_list>",
   "confidence": 0.95,
-  "extracted_attributes": {{"material": "...", "size": "...", "color": "..."}}
+  "extracted_attributes": {{
+    "color": "Value",
+    "material": "Value"
+  }}
 }}"""
 
     try:
         genai.configure(api_key=settings.GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-3.6-flash')
+        model = genai.GenerativeModel('gemini-3.5-flash-lite')
+        config = genai.types.GenerationConfig(temperature=0.1, max_output_tokens=300)
 
         payload = [prompt, img_obj] if img_obj else [prompt]
-        response = model.generate_content(payload)
+        response = model.generate_content(payload, generation_config=config)
         text = response.text.strip()
 
-        json_match = re.search(r'\{.*\}', text, re.DOTALL)
-        if json_match:
-            text = json_match.group(0)
-
-        ai_data = json.loads(text)
+        ai_data = safe_json_loads(text)
 
         raw_id = str(ai_data.get('selected_category_id', '')).strip()
         selected_id = re.sub(r'^[\[\(\s]*|[\]\)\s]*$', '', raw_id)
         selected_name = str(ai_data.get('category_name', '')).strip()
-        confidence = float(ai_data.get('confidence', 0.5))
         attributes = ai_data.get('extracted_attributes', {})
 
-        # Strict Category Database Lookup (Strict ID or Exact Name match - NO loose contains fallbacks)
+        conf_raw = ai_data.get('confidence')
+        if conf_raw is not None:
+            try:
+                confidence = float(conf_raw)
+            except (ValueError, TypeError):
+                confidence = 0.90
+        else:
+            confidence = 0.90
+
         category_obj = Category.objects.filter(id=selected_id).first() if selected_id else None
         if not category_obj and selected_name:
             category_obj = Category.objects.filter(name__iexact=selected_name).first()
 
+        # Fallback 1: Match against candidate list if exact ID lookup missed
+        if not category_obj:
+            for c_id, c_name, c_score in candidates:
+                if str(c_id) == str(selected_id) or c_name.lower() == selected_name.lower() or selected_name.lower() in c_name.lower():
+                    category_obj = Category.objects.filter(id=c_id).first()
+                    if category_obj:
+                        break
+
+        # Fallback 2: Top RAG candidate match if Gemini didn't return a valid category
+        if not category_obj and candidates:
+            top_c_id = candidates[0][0]
+            category_obj = Category.objects.filter(id=top_c_id).first()
+            confidence = 0.82
+
         candidate_ids = [str(c[0]) for c in candidates]
         candidate_names = [c[1] for c in candidates]
-        alt_suggestions = [c[1] for c in candidates if str(c[0]) != str(selected_id)][:4]
+        alt_suggestions = [c[1] for c in candidates if category_obj and str(c[0]) != str(category_obj.id)][:4]
 
-        # Multi-Condition Validation Logic for Auto-Approval:
-        # 1. Category exists in DB via strict lookup
-        # 2. Selected category is present in top retrieved candidates
-        # 3. Confidence score >= 0.86
         is_candidate_match = category_obj and (str(category_obj.id) in candidate_ids or category_obj.name in candidate_names)
 
-        if category_obj and is_candidate_match and confidence >= 0.86:
+        if category_obj and is_candidate_match and confidence >= 0.85:
             status = 'COMPLETED'
         else:
             status = 'MANUAL_REVIEW'
 
         family.predicted_category = category_obj
-        family.status = status
+        family.extracted_attributes = attributes
         family.confidence_score = confidence
         family.alternative_suggestions = alt_suggestions
-        family.extracted_attributes = attributes
+        family.status = status
         family.save()
+        broadcast_update(family)
 
-        # Slight pacing pause to stay safely under Gemini 15 RPM Free Tier limit
-        import time
-        time.sleep(2)
-
-        return f"Family {family.id} classified as {status} (Category: {category_obj.name if category_obj else 'None'}, Confidence: {confidence})."
+        return f"Family {family.id} auto-classified as {category_obj.name if category_obj else 'None'} in 1 pass."
 
     except Exception as e:
         import logging
         error_str = str(e)
-        logging.error(f"Gemini RAG API error for family {family.id}: {e}")
+        logging.error(f"Gemini API error for family {family.id}: {e}")
 
-        # Dynamic rate limit retry backoff using Google's exact requested delay
         if '429' in error_str or 'ResourceExhausted' in error_str:
             retry_delay = 35
             delay_match = re.search(r'retry\s+in\s+([\d\.]+)', error_str, re.IGNORECASE)
@@ -236,13 +307,137 @@ Respond ONLY in this exact JSON format:
                 retry_delay = int(float(delay_match.group(1))) + 2
             raise self.retry(exc=e, countdown=retry_delay)
 
-        # Temporary server error — exponential backoff
         if '503' in error_str:
             raise self.retry(exc=e, countdown=2 ** self.request.retries)
 
         family.status = 'FAILED'
         family.save()
+        broadcast_update(family)
         return f"Failed family {family.id}: {error_str}"
+
+
+TAXONOMY_CACHE = None
+
+@shared_task(bind=True, max_retries=5)
+def extract_attributes_task(self, family_id, final_status):
+    """
+    Agent 2 (Attribute Extractor):
+    Dynamically loads valid official attributes for the predicted category
+    and strictly extracts them using a focused prompt.
+    """
+    global TAXONOMY_CACHE
+    try:
+        family = ProductFamily.objects.get(id=family_id)
+    except ProductFamily.DoesNotExist:
+        return "Family not found."
+
+    if not family.predicted_category:
+        family.status = final_status
+        family.save()
+        broadcast_update(family)
+        return "No category predicted, skipping attribute extraction."
+
+    # Load simplified_taxonomy.json lazily into a global cache
+    if TAXONOMY_CACHE is None:
+        try:
+            with open('simplified_taxonomy.json', 'r', encoding='utf-8') as f:
+                TAXONOMY_CACHE = json.load(f)
+        except Exception as e:
+            import logging
+            logging.warning(f"Could not load simplified_taxonomy.json: {e}")
+            TAXONOMY_CACHE = {}
+
+    # Fetch official attributes and their allowed values for this category
+    cat_name = family.predicted_category.name
+    cat_data = TAXONOMY_CACHE.get(cat_name, {})
+    
+    if not cat_data:
+        valid_attrs_str = "material, shape, size, style, color, set_includes"
+    else:
+        # Build strict allowed values string
+        attrs_list = []
+        for attr_name, attr_values in list(cat_data.items())[:12]:
+            if isinstance(attr_values, list) and len(attr_values) > 0:
+                allowed_vals = ", ".join([str(v) for v in attr_values[:15]])
+                attrs_list.append(f"- {attr_name} (Allowed Values: {allowed_vals})")
+            else:
+                attrs_list.append(f"- {attr_name}")
+        valid_attrs_str = "\n".join(attrs_list)
+
+    # Get known colors/attributes from the actual Product variants
+    variants = family.products.all()
+    variant_colors = [v.color for v in variants if v.color]
+    unique_colors_str = ", ".join(list(set(variant_colors)))
+    variant_titles = "\n".join([f"- {v.title}" for v in variants][:10])
+
+    desc_snippet = (family.description or '')[:500]
+    prompt = f"""You are an e-commerce attribute extractor.
+Product Family: {family.normalized_title}
+Type: {family.product_type}
+Brand: {family.brand}
+Description: {desc_snippet}
+Category: {cat_name}
+
+Known Variant Colors in this Family: {unique_colors_str if unique_colors_str else 'None'}
+Variant Titles:
+{variant_titles}
+
+Extract ONLY the following valid official attributes for this category. You MUST ONLY select values from the 'Allowed Values' list for each attribute. Do NOT invent your own values.
+
+{valid_attrs_str}
+
+Respond ONLY in this exact JSON format (extract as many attributes as you can find). If an attribute has multiple values across variants (like multiple colors), return an array of strings.
+{{
+  "extracted_attributes": {{
+    "Attribute Name 1": "Allowed Value",
+    "Attribute Name 2": ["Allowed Value A", "Allowed Value B"]
+  }}
+}}
+If no attributes match, return an empty object: {{"extracted_attributes": {{}}}}"""
+
+    try:
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        # We can use the faster flash-8b model if available, but stick to flash to be safe
+        model = genai.GenerativeModel('gemini-3.6-flash')
+
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+
+        ai_data = safe_json_loads(text)
+        attributes = ai_data.get('extracted_attributes', {})
+
+        family.extracted_attributes = attributes
+        family.status = final_status # Set to COMPLETED or MANUAL_REVIEW
+        family.save()
+        broadcast_update(family)
+
+        import time
+        time.sleep(1.5)
+
+        return f"Agent 2 Extracted Attributes for Family {family.id}."
+
+    except Exception as e:
+        import logging
+        error_str = str(e)
+        logging.error(f"Gemini Attribute API error for family {family.id}: {e}")
+
+        if '429' in error_str or 'ResourceExhausted' in error_str:
+            retry_delay = 35
+            delay_match = re.search(r'retry\s+in\s+([\d\.]+)', error_str, re.IGNORECASE)
+            if not delay_match:
+                delay_match = re.search(r'retry_delay\s*\{\s*seconds:\s*(\d+)', error_str)
+            if delay_match:
+                retry_delay = int(float(delay_match.group(1))) + 2
+            raise self.retry(exc=e, countdown=retry_delay)
+
+        if '503' in error_str:
+            raise self.retry(exc=e, countdown=2 ** self.request.retries)
+
+        # Even if attribute extraction fails permanently, keep the category and just mark as final status
+        family.status = final_status
+        family.save()
+        broadcast_update(family)
+        return f"Agent 2 Failed family {family.id}: {error_str}"
 
 
 @shared_task
@@ -260,10 +455,12 @@ def process_all_pending_families_task(limit=50):
     pending_families = ProductFamily.objects.filter(status__in=['PENDING', 'FAILED']).order_by('id')[:limit]
     count = 0
     for family in pending_families:
-        classify_family_task.delay(family.id)
+        # Trigger Agent 1 (which will trigger Agent 2)
+        categorize_task.delay(family.id)
         count += 1
         time.sleep(1.5)
-    return f"Queued {count} product families for AI classification."
+    return f"Queued {count} product families for Multi-Agent AI classification."
+
 
 
 

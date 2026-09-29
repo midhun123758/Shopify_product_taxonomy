@@ -23,7 +23,7 @@ services:
   web:
     build: .
     container_name: shopify_web
-    command: gunicorn taxonomy_project.wsgi:application --bind 0.0.0.0:8000
+    command: daphne -b 0.0.0.0 -p 8000 taxonomy_project.asgi:application
     volumes:
       - .:/app
     depends_on:
