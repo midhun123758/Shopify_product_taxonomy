@@ -17,3 +17,10 @@ django-cors-headers
 google-generativeai
 Pillow
 requests
+qdrant-client
+fastembed
+channels
+daphne
+channels_redis
+mcp 
+langsmith
